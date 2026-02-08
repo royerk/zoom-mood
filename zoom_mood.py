@@ -18,6 +18,7 @@ import json
 import sys
 import threading
 import time
+import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -80,23 +81,43 @@ class EmotionEngine:
         self._init_face_detector()
         self._init_emotion_model()
 
-    # -- Face detection (MediaPipe) ----------------------------------------
+    # -- Face detection (MediaPipe Tasks API) ---------------------------------
+
+    MODEL_URL = (
+        "https://storage.googleapis.com/mediapipe-models/"
+        "face_detector/blaze_face_short_range/float16/1/"
+        "blaze_face_short_range.tflite"
+    )
+    MODEL_FILENAME = "blaze_face_short_range.tflite"
+
+    def _ensure_model(self) -> str:
+        """Download the face detection model if it doesn't exist yet."""
+        model_dir = Path(__file__).parent
+        model_path = model_dir / self.MODEL_FILENAME
+        if not model_path.exists():
+            print(f"📥  Downloading face detection model...")
+            urllib.request.urlretrieve(self.MODEL_URL, str(model_path))
+            print(f"   Saved to {model_path}")
+        return str(model_path)
 
     def _init_face_detector(self):
         import mediapipe as mp
-        self.mp_face = mp.solutions.face_detection
-        self.detector = self.mp_face.FaceDetection(
-            model_selection=1,      # full-range model (better for screen caps)
+        self.mp = mp
+        model_path = self._ensure_model()
+        base_options = mp.tasks.BaseOptions(model_asset_path=model_path)
+        options = mp.tasks.vision.FaceDetectorOptions(
+            base_options=base_options,
+            running_mode=mp.tasks.vision.RunningMode.IMAGE,
             min_detection_confidence=0.5,
         )
+        self.detector = mp.tasks.vision.FaceDetector.create_from_options(options)
 
     # -- Emotion classification (HSEmotion ONNX) ---------------------------
 
     def _init_emotion_model(self):
-        from hsemotion.facial_emotions import HSEmotionRecognizer
+        from hsemotion_onnx.facial_emotions import HSEmotionRecognizer
         self.recognizer = HSEmotionRecognizer(
             model_name="enet_b0_8_best_vgaf",
-            device="cpu",
         )
 
     # -- Pipeline ----------------------------------------------------------
@@ -106,19 +127,23 @@ class EmotionEngine:
         result = FrameResult(timestamp=time.time())
         h, w, _ = frame_bgr.shape
 
-        # MediaPipe wants RGB
+        # Convert to RGB and wrap in mp.Image for the Tasks API
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        detections = self.detector.process(frame_rgb)
+        mp_image = self.mp.Image(
+            image_format=self.mp.ImageFormat.SRGB, data=frame_rgb
+        )
+        detection_result = self.detector.detect(mp_image)
 
-        if not detections.detections:
+        if not detection_result.detections:
             return result
 
-        for i, det in enumerate(detections.detections):
-            bbox = det.location_data.relative_bounding_box
-            x1 = max(0, int(bbox.xmin * w))
-            y1 = max(0, int(bbox.ymin * h))
-            bw = int(bbox.width * w)
-            bh = int(bbox.height * h)
+        for i, det in enumerate(detection_result.detections):
+            # New Tasks API returns pixel coordinates directly
+            bbox = det.bounding_box
+            x1 = max(0, bbox.origin_x)
+            y1 = max(0, bbox.origin_y)
+            bw = bbox.width
+            bh = bbox.height
             x2 = min(w, x1 + bw)
             y2 = min(h, y1 + bh)
 
@@ -147,8 +172,8 @@ class EmotionEngine:
                 }
                 dominant = max(score_dict, key=score_dict.get)
                 confidence = score_dict[dominant]
-            except Exception as e:
-                print(f"⚠️  Emotion classification failed: {e}")
+            except Exception as exc:
+                print(f"⚠️  Emotion classification failed: {exc}")
                 dominant = "Neutral"
                 confidence = 0.0
                 score_dict = {e: 0.0 for e in EMOTIONS}
@@ -204,9 +229,19 @@ class ScreenCapture:
 
 def select_region_interactive() -> dict:
     """Let the user draw a rectangle on screen to select the Zoom window."""
-    print("\n📐  Region selection mode")
-    print("   A fullscreen screenshot will appear.")
-    print("   Click and drag to select the Zoom window area, then press ENTER.\n")
+    print()
+    print("=" * 50)
+    print("  📐  REGION SELECTION")
+    print("=" * 50)
+    print()
+    print("  1. Position your Zoom window where you want it")
+    print("  2. Press ENTER below — a screenshot will be taken")
+    print("  3. Draw a box around the Zoom gallery in the screenshot")
+    print("     (you can Cmd+Tab away to peek at Zoom, then come back)")
+    print("  4. Press ENTER or SPACE in the screenshot window to confirm")
+    print("  5. Press C to cancel and use full screen instead")
+    print()
+    input("  Ready? Press ENTER to take screenshot...")
 
     sct = mss.mss()
     monitor = sct.monitors[1]
@@ -224,20 +259,38 @@ def select_region_interactive() -> dict:
     else:
         img_display = img.copy()
 
-    roi = cv2.selectROI("Select Zoom Window — press ENTER when done", img_display, False, False)
+    # Add instructional overlay text
+    overlay = img_display.copy()
+    cv2.putText(
+        overlay, "Draw a rectangle around Zoom gallery, then press ENTER",
+        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
+    )
+    cv2.putText(
+        overlay, "Press C to cancel",
+        (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 200), 1,
+    )
+
+    window_name = "Zoom Mood — Select Region (ENTER to confirm, C to cancel)"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    # NOT topmost — lets you Cmd+Tab to peek at other windows
+
+    roi = cv2.selectROI(window_name, overlay, False, False)
     cv2.destroyAllWindows()
 
     if roi[2] == 0 or roi[3] == 0:
-        print("No region selected, using full primary monitor.")
+        print("  No region selected — using full primary monitor.")
         return monitor
 
     x, y, w, h = roi
-    return {
+    region = {
         "left":   int(x / scale) + monitor["left"],
         "top":    int(y / scale) + monitor["top"],
         "width":  int(w / scale),
         "height": int(h / scale),
     }
+    print(f"  ✅  Region set: {region['width']}x{region['height']} "
+          f"at ({region['left']}, {region['top']})")
+    return region
 
 
 # ---------------------------------------------------------------------------
